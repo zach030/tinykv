@@ -266,12 +266,10 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	// 如果收到消息的term更大，则需要更新term
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, None)
-	}
+	r.prevCheck(m)
 	switch r.State {
 	case StateFollower:
+		return r.stepFollower(m)
 	case StateCandidate:
 		return r.stepCandidate(m)
 	case StateLeader:
@@ -280,19 +278,84 @@ func (r *Raft) Step(m pb.Message) error {
 	return nil
 }
 
+func (r *Raft) prevCheck(m pb.Message) {
+	// 如果是发送消息，不做检查
+	if m.From == r.id {
+		return
+	}
+	// 如果是接收消息
+	// 如果收到消息的term更大，则需要更新term
+	if m.Term > r.Term {
+		// 变为follow
+		r.becomeFollower(m.Term, None)
+	}
+}
+
+func (r *Raft) stepFollower(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		// 自己发给自己的 说明选举超时，开启新的选举
+		r.becomeCandidate()
+		if len(r.Prs) < 2 {
+			r.becomeLeader()
+		}
+	case pb.MessageType_MsgRequestVote:
+		// 如果是请求投票rpc
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		// 如果我还没投，或者我投的是你，则可以继续投给你
+		if r.Vote == None || r.Vote == m.From {
+			//todo msg 索引检查
+			msg.Reject = false
+		}
+		r.msgs = append(r.msgs, msg)
+	case pb.MessageType_MsgHeartbeat:
+		// 如果是心跳
+		r.handleHeartbeat(m)
+	}
+	return nil
+}
+
 func (r *Raft) stepCandidate(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgRequestVote:
-		r.broadcastRequestVote()
+		if m.From == r.id {
+			// r请求投票
+			r.broadcastRequestVote()
+		} else if m.To == r.id {
+			// 别人请求r投票
+			msg := pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  true,
+			}
+			// 如果我还没投，或者我投的是你，则可以继续投给你
+			if r.Vote == None || r.Vote == m.From {
+				msg.Reject = false
+			}
+			r.msgs = append(r.msgs, msg)
+		}
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.resolveVoteResponse(m)
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
 	}
 	return nil
 }
 
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgHup:
-	case pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgBeat, pb.MessageType_MsgHeartbeat:
 		r.broadcastHeartBeat()
+	case pb.MessageType_MsgHeartbeatResponse:
+		r.sendAppend(m.From)
 	}
 	return nil
 }
@@ -303,6 +366,21 @@ func (r *Raft) broadcastRequestVote() {
 			continue
 		}
 		r.sendRequestVote(peer)
+	}
+}
+
+func (r *Raft) resolveVoteResponse(m pb.Message) {
+	// response other
+	// recv vote response
+	r.votes[m.From] = !m.Reject
+	agree := 0
+	for _, state := range r.votes {
+		if state {
+			agree++
+		}
+	}
+	if agree > len(r.Prs)/2 {
+		r.becomeLeader()
 	}
 }
 
@@ -332,7 +410,27 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
+	if r.Term != None && r.Term > m.Term {
+		// 如果leader的term更小，则拒绝此次心跳
+		r.sendHeartbeatResponse(m.From, true)
+		return
+	}
+	// 接收心跳信息，与leader同步
+	r.Lead = m.From
+	r.heartbeatElapsed = 0
+	r.sendHeartbeatResponse(m.From, false)
 	// Your Code Here (2A).
+}
+
+func (r *Raft) sendHeartbeatResponse(to uint64, reject bool) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  reject,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // handleSnapshot handle Snapshot RPC request
