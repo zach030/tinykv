@@ -217,20 +217,31 @@ func (r *Raft) sendHeartbeat(to uint64) {
 func (r *Raft) tick() {
 	switch r.State {
 	case StateLeader:
-		r.heartbeatElapsed++
-		if r.heartbeatElapsed >= r.heartbeatTimeout {
-			r.heartbeatElapsed = 0
-			r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
-		}
+		r.tickWithHeartbeat()
 	case StateFollower, StateCandidate:
-		r.electionElapsed++
-		if r.electionElapsed >= r.electionTimeout {
-			r.electionElapsed = 0
-			r.becomeCandidate()
-			r.Step(pb.Message{MsgType: pb.MessageType_MsgRequestVote})
-		}
+		r.tickWithElection()
 	}
 	// Your Code Here (2A).
+}
+
+// tickWithHeartbeat leader用于处理心跳时钟
+func (r *Raft) tickWithHeartbeat() {
+	r.heartbeatElapsed++
+	// 定期发送心跳
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.resetHeartbeatTimer()
+		// 发送本地beat消息，需要发心跳
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+	}
+}
+
+// tickWithElection follower和candidate用于处理选举时钟
+func (r *Raft) tickWithElection() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.electionTimeout {
+		// 选举时钟超时：开始一轮新的选举
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -249,8 +260,8 @@ func (r *Raft) becomeCandidate() {
 	r.Term++
 	// 修改vote为自身
 	r.Vote = r.id
-	// 重置选举超时计时器
 	r.votes[r.id] = true
+	r.Lead = None
 	// Your Code Here (2A).
 }
 
@@ -258,6 +269,7 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
+	r.Vote = None
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 }
@@ -266,7 +278,7 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	r.prevCheck(m)
+	r.doPrevCheck(m)
 	switch r.State {
 	case StateFollower:
 		return r.stepFollower(m)
@@ -278,7 +290,7 @@ func (r *Raft) Step(m pb.Message) error {
 	return nil
 }
 
-func (r *Raft) prevCheck(m pb.Message) {
+func (r *Raft) doPrevCheck(m pb.Message) {
 	// 如果是发送消息，不做检查
 	if m.From == r.id {
 		return
@@ -294,28 +306,10 @@ func (r *Raft) prevCheck(m pb.Message) {
 func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
-		// 自己发给自己的 说明选举超时，开启新的选举
-		r.becomeCandidate()
-		if len(r.Prs) < 2 {
-			r.becomeLeader()
-		}
+		r.startElection()
 	case pb.MessageType_MsgRequestVote:
-		// 如果是请求投票rpc
-		msg := pb.Message{
-			MsgType: pb.MessageType_MsgRequestVoteResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		}
-		// 如果我还没投，或者我投的是你，则可以继续投给你
-		if r.Vote == None || r.Vote == m.From {
-			//todo msg 索引检查
-			msg.Reject = false
-		}
-		r.msgs = append(r.msgs, msg)
+		r.handleRequestVote(m)
 	case pb.MessageType_MsgHeartbeat:
-		// 如果是心跳
 		r.handleHeartbeat(m)
 	}
 	return nil
@@ -323,27 +317,12 @@ func (r *Raft) stepFollower(m pb.Message) error {
 
 func (r *Raft) stepCandidate(m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.startElection()
 	case pb.MessageType_MsgRequestVote:
-		if m.From == r.id {
-			// r请求投票
-			r.broadcastRequestVote()
-		} else if m.To == r.id {
-			// 别人请求r投票
-			msg := pb.Message{
-				MsgType: pb.MessageType_MsgRequestVoteResponse,
-				To:      m.From,
-				From:    r.id,
-				Term:    r.Term,
-				Reject:  true,
-			}
-			// 如果我还没投，或者我投的是你，则可以继续投给你
-			if r.Vote == None || r.Vote == m.From {
-				msg.Reject = false
-			}
-			r.msgs = append(r.msgs, msg)
-		}
+		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse:
-		r.resolveVoteResponse(m)
+		r.handleVoteResponse(m)
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
 	}
@@ -352,12 +331,58 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgBeat, pb.MessageType_MsgHeartbeat:
+	case pb.MessageType_MsgBeat:
+		// 需要leader发送广播心跳
 		r.broadcastHeartBeat()
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.sendAppend(m.From)
 	}
 	return nil
+}
+
+// startElection follower心跳超时成为候选人 or 候选人选举超时，发起选举
+func (r *Raft) startElection() {
+	// 成为候选人
+	r.becomeCandidate()
+	// 重置选举超时计时器
+	r.resetElectionTimer()
+	if len(r.Prs) < 2 {
+		r.becomeLeader()
+		return
+	}
+	// 发送请求投票rpc
+	r.broadcastRequestVote()
+}
+
+// handleRequestVote 接收投票请求
+func (r *Raft) handleRequestVote(m pb.Message) {
+	// 判断对方的任期
+	if m.Term != None && m.Term < r.Term {
+		// 对方任期小，拒绝投票
+		r.sendResponseVote(m.From, true)
+		return
+	}
+	// 判断自己是否投过票
+	if r.Vote != None && r.Vote != m.From {
+		// 当前任期内已经给其他人投过票，拒绝此次投票
+		r.sendResponseVote(m.From, true)
+		return
+	}
+	// todo 判断日志索引
+	r.Vote = m.From
+	r.resetElectionTimer()
+	// 成功投票给对方
+	r.sendResponseVote(m.From, false)
+}
+
+// resetHeartbeatTimer 重置心跳超时计时器
+func (r *Raft) resetHeartbeatTimer() {
+	r.heartbeatElapsed = 0
+}
+
+// resetElectionTimer 重置选举超时计时器
+func (r *Raft) resetElectionTimer() {
+	r.electionElapsed = 0
 }
 
 func (r *Raft) broadcastRequestVote() {
@@ -369,18 +394,24 @@ func (r *Raft) broadcastRequestVote() {
 	}
 }
 
-func (r *Raft) resolveVoteResponse(m pb.Message) {
-	// response other
-	// recv vote response
+// handleVoteResponse candidate用于处理其他人的投票回复
+func (r *Raft) handleVoteResponse(m pb.Message) {
+	// 判断对方任期
 	r.votes[m.From] = !m.Reject
 	agree := 0
+	allVote := len(r.votes)
 	for _, state := range r.votes {
 		if state {
 			agree++
 		}
 	}
+	// 超半数 获选
 	if agree > len(r.Prs)/2 {
 		r.becomeLeader()
+	}
+	// 有其他candidate获选
+	if allVote-agree > len(r.Prs)/2 {
+		r.becomeFollower(r.Term, None)
 	}
 }
 
@@ -393,12 +424,25 @@ func (r *Raft) broadcastHeartBeat() {
 	}
 }
 
+// sendRequestVote candidate send request for vote
 func (r *Raft) sendRequestVote(peer uint64) {
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
 		To:      peer,
 		From:    r.id,
 		Term:    r.Term,
+	}
+	r.msgs = append(r.msgs, msg)
+}
+
+// sendResponseVote follower/candidate send response for vote-request
+func (r *Raft) sendResponseVote(to uint64, reject bool) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  reject,
 	}
 	r.msgs = append(r.msgs, msg)
 }
