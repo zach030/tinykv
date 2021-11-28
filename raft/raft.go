@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -135,6 +136,8 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
+
+	randomElectionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -173,6 +176,7 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 		RaftLog:          newLog(c.Storage),
 	}
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	hardSt, confSt, _ := r.RaftLog.storage.InitialState()
 	if c.peers == nil {
 		c.peers = confSt.Nodes
@@ -238,7 +242,7 @@ func (r *Raft) tickWithHeartbeat() {
 // tickWithElection follower和candidate用于处理选举时钟
 func (r *Raft) tickWithElection() {
 	r.electionElapsed++
-	if r.electionElapsed >= r.electionTimeout {
+	if r.electionElapsed >= r.randomElectionTimeout {
 		// 选举时钟超时：开始一轮新的选举
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 	}
@@ -383,6 +387,7 @@ func (r *Raft) resetHeartbeatTimer() {
 // resetElectionTimer 重置选举超时计时器
 func (r *Raft) resetElectionTimer() {
 	r.electionElapsed = 0
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 func (r *Raft) broadcastRequestVote() {
@@ -461,7 +466,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 	// 接收心跳信息，与leader同步
 	r.Lead = m.From
-	r.heartbeatElapsed = 0
+	r.resetElectionTimer()
+	r.resetHeartbeatTimer()
 	r.sendHeartbeatResponse(m.From, false)
 	// Your Code Here (2A).
 }

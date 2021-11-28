@@ -194,14 +194,14 @@ eraftpb.MessageType. Note that every step is checked by one common method
 stale log entries:
 
 	'MessageType_MsgHup' is used for election. If a node is a follower or candidate, the
-	'tick' function in 'raft' struct is set as 'tickWithElection'. If a follower or
+	'tick' function in 'raft' struct is set as 'tickElection'. If a follower or
 	candidate has not received any heartbeat before the election timeout, it
 	passes 'MessageType_MsgHup' to its Step method and becomes (or remains) a candidate to
 	start a new election.
 
 	'MessageType_MsgBeat' is an internal type that signals the leader to send a heartbeat of
 	the 'MessageType_MsgHeartbeat' type. If a node is a leader, the 'tick' function in
-	the 'raft' struct is set as 'tickWithHeartbeat', and triggers the leader to
+	the 'raft' struct is set as 'tickHeartbeat', and triggers the leader to
 	send periodic 'MessageType_MsgHeartbeat' messages to its followers.
 
 	'MessageType_MsgPropose' proposes to append data to its log entries. This is a special
