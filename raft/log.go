@@ -50,19 +50,34 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	firstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	rl := &RaftLog{
-		storage:         storage,
-		committed:       0,
-		applied:         0,
-		stabled:         0,
-		entries:         make([]pb.Entry, 0),
-		pendingSnapshot: nil,
+	if storage == nil {
+		panic("storage must not nil")
 	}
+	rl := &RaftLog{
+		storage: storage,
+	}
+	firstIdx, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	lastIdx, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	entries, err := storage.Entries(firstIdx, lastIdx+1)
+	if err != nil {
+		panic(err)
+	}
+	rl.entries = entries
+	rl.stabled = lastIdx
+	rl.applied = firstIdx - 1
+	rl.firstIndex = firstIdx
 	// Your Code Here (2A).
 	return rl
 }
@@ -76,12 +91,18 @@ func (l *RaftLog) maybeCompact() {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
+	if len(l.entries) > 0 {
+		return l.entries[l.stabled-l.firstIndex+1:]
+	}
 	// Your Code Here (2A).
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
+	if len(l.entries) > 0 {
+		return l.entries[l.committed-l.firstIndex+1 : l.applied-l.firstIndex+1]
+	}
 	// Your Code Here (2A).
 	return nil
 }
@@ -89,11 +110,17 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return l.applied
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	return 0
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 && i >= l.firstIndex {
+		return l.entries[i-l.firstIndex].Term, nil
+	}
 	return 0, nil
 }

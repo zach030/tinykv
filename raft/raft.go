@@ -105,7 +105,7 @@ func (c *Config) validate() error {
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
-	Match, Next uint64
+	Match, Next uint64 // 发送到服务器的下一条日志索引；已经复制到该服务器的最高日志索引
 }
 
 type Raft struct {
@@ -176,6 +176,7 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 		RaftLog:          newLog(c.Storage),
 	}
+	// 随机的选举过期值
 	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	hardSt, confSt, _ := r.RaftLog.storage.InitialState()
 	if c.peers == nil {
@@ -198,11 +199,41 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+// leader接收到来自client的请求，apply应用到状态机
+// leader在接收到超半数的回复后再commit
+// 更新server的match与next
+// leader将自己维护的next索引数据发送给follower，follower根据自己的commitindex来回复接不接受，leader会将next依次递减发送
+// 再向其他服务器发送commit请求，各个节点均commit
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	// 获取之前发给此节点的日志索引
+	prevAppendLogIdx := r.Prs[to].Next - 1
+	// 获取之前发送的日志term
+	logTerm, err := r.RaftLog.Term(prevAppendLogIdx)
+	if err != nil {
+		return false
+	}
+	// 将prevIdx+1--size 这部分日志发出去
+	size := len(r.RaftLog.entries)
+	ents := make([]*pb.Entry, 0)
+	for i := int(prevAppendLogIdx - r.RaftLog.firstIndex + 1); i < size; i++ {
+		ents = append(ents, &r.RaftLog.entries[i])
+	}
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: logTerm,
+		Index:   prevAppendLogIdx,
+		Entries: ents,
+		Commit:  r.RaftLog.committed,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -274,8 +305,37 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 	r.Vote = None
+	r.resetElectionTimer()
+	lastIdx := r.RaftLog.LastIndex()
+	for peer := range r.Prs {
+		if peer == r.id {
+			r.Prs[peer].Next = lastIdx + 2
+			r.Prs[peer].Match = lastIdx + 1
+			continue
+		}
+		r.Prs[peer].Next = lastIdx + 1
+	}
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		EntryType:            0,
+		Term:                 r.Term,
+		Index:                lastIdx + 1,
+		Data:                 nil,
+		XXX_NoUnkeyedLiteral: struct{}{},
+		XXX_unrecognized:     nil,
+		XXX_sizecache:        0,
+	})
+	// r.broadcastAppend()
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+}
+
+func (r *Raft) broadcastAppend() {
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendAppend(peer)
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -340,8 +400,24 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.broadcastHeartBeat()
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.sendAppend(m.From)
+	case pb.MessageType_MsgPropose:
+		r.appendEntries(m.Entries)
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendEntriesResponse(m)
 	}
 	return nil
+}
+
+func (r *Raft) appendEntries(entries []*pb.Entry) {
+	lastIdx := r.RaftLog.LastIndex()
+	for i, entry := range entries {
+		entry.Term = r.Term
+		entry.Index = lastIdx + uint64(i) + 1
+		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+	r.broadcastAppend()
 }
 
 // startElection follower心跳超时成为候选人 or 候选人选举超时，发起选举
@@ -455,6 +531,13 @@ func (r *Raft) sendResponseVote(to uint64, reject bool) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+}
+
+func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
+	if m.Term != None && m.Term < r.Term {
+		return
+	}
+	// todo handle append-response
 }
 
 // handleHeartbeat handle Heartbeat RPC request
