@@ -240,9 +240,8 @@ func (r *Raft) becomeLeader() {
 		r.Prs[peer].Next = lastIdx + 1
 	}
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
-		EntryType: pb.EntryType_EntryNormal,
-		Term:      r.Term,
-		Index:     lastIdx + 1,
+		Term:  r.Term,
+		Index: lastIdx + 1,
 	})
 	if len(r.Prs) == 1 {
 		r.RaftLog.committed = r.Prs[r.id].Match
@@ -336,7 +335,10 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleVoteResponse(m)
 	case pb.MessageType_MsgAppend:
-		r.becomeFollower(m.Term, m.From)
+		if m.Term == r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+		r.handleAppendEntries(m)
 	}
 	return nil
 }
@@ -348,6 +350,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.broadcastHeartBeat()
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.sendAppend(m.From)
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
 	case pb.MessageType_MsgPropose:
 		r.appendEntries(m.Entries)
 	case pb.MessageType_MsgAppend:
@@ -387,7 +391,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 将prevIdx+1--size 这部分日志发出去
 	size := len(r.RaftLog.entries)
 	ents := make([]*pb.Entry, 0)
-	for i := int(prevAppendLogIdx - r.RaftLog.firstIndex + 1); i < size; i++ {
+	for i := int(prevAppendLogIdx + 1 - r.RaftLog.firstIndex); i < size; i++ {
 		ents = append(ents, &r.RaftLog.entries[i])
 	}
 	msg := pb.Message{
@@ -571,27 +575,31 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.resetElectionTimer()
 	r.Lead = m.From
 	logLastIdx := r.RaftLog.LastIndex()
-	log.Infof("node:%v ,log last index is:%v", r.id, logLastIdx)
+	// log.Infof("node:%v ,log last index is:%v", r.id, logLastIdx)
 	if m.Index > logLastIdx {
 		// 如果leader发来的消息索引大于我本地最大的消息，则修改期望发送的消息
 		r.sendAppendResponse(m.From, logLastIdx+1, None, true)
 		return
 	}
 	logFirstIdx := r.RaftLog.firstIndex
-	log.Infof("node:%v ,log first index is:%v", r.id, logFirstIdx)
+	// log.Infof("node:%v ,log first index is:%v", r.id, logFirstIdx)
 	if m.Index >= logFirstIdx {
-		log.Infof("node:%v,recv msg index:%v bigger than first index:%v, need to find out conflict", r.id, m.Index, logFirstIdx)
+		// log.Infof("node:%v,recv msg index:%v bigger than first index:%v, need to find out conflict", r.id, m.Index, logFirstIdx)
 		// 根据msg的index查到term
 		logTerm, err := r.RaftLog.Term(m.Index)
 		if err != nil {
 			panic(err)
 		}
-		log.Infof("node:%v,entry term:%v,index:%v", r.id, logTerm, m.Index)
+		// log.Infof("node:%v,entry term:%v,index:%v", r.id, logTerm, m.Index)
 		// 如果不等，则说明有冲突
 		if logTerm != m.LogTerm {
-			log.Infof("node:%v, rev msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
+			offset := sort.Search(int(m.Index+1-r.RaftLog.firstIndex), func(i int) bool {
+				return r.RaftLog.entries[i].Term == logTerm
+			})
+			index := uint64(offset) + r.RaftLog.firstIndex
+			// log.Infof("node:%v, rev msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
 			// todo 找到对应term和index的日志索引
-			r.sendAppendResponse(m.From, 0, logTerm, true)
+			r.sendAppendResponse(m.From, index, logTerm, true)
 			return
 		}
 	}
@@ -621,6 +629,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if m.Commit > r.RaftLog.committed {
 		// 取两者的较小值
 		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
+		log.Infof("node:%v,state:%v,commit:%v", r.id, r.State.String(), r.RaftLog.committed)
 	}
 	r.sendAppendResponse(m.From, logLastIdx, None, false)
 	// Your Code Here (2A).
@@ -632,8 +641,21 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	}
 	// 如果其他节点拒绝接收
 	if m.Reject {
-		// idx := m.Index
-		return
+		idx := m.Index
+		if m.LogTerm != None {
+			logTerm := m.LogTerm
+			l := r.RaftLog
+			sliceIndex := sort.Search(len(l.entries),
+				func(i int) bool { return l.entries[i].Term > logTerm })
+			if sliceIndex > 0 && l.entries[sliceIndex-1].Term == logTerm {
+				idx = uint64(sliceIndex) - r.RaftLog.firstIndex + 1
+			}
+			// 更新next
+			r.Prs[m.From].Next = idx
+			// 继续发送append请求
+			r.sendAppend(m.From)
+			return
+		}
 	}
 	// 同意接收数据，判断server返回的index
 	if m.Index > r.Prs[m.From].Match {
@@ -642,7 +664,6 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		// 判断是否超半数接收append，leader可提交
 		r.leaderCommit()
 	}
-	// todo handle append-response
 }
 
 // leaderCommit 判断是否收到半数的append回复，更新commit
