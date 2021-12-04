@@ -19,6 +19,8 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log"
+
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -179,6 +181,7 @@ func newRaft(c *Config) *Raft {
 	}
 	// 随机的选举过期值
 	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	// 从raftlog中恢复存储的状态
 	hardSt, confSt, _ := r.RaftLog.storage.InitialState()
 	if c.peers == nil {
 		c.peers = confSt.Nodes
@@ -241,7 +244,11 @@ func (r *Raft) becomeLeader() {
 		Term:      r.Term,
 		Index:     lastIdx + 1,
 	})
-	// r.broadcastAppend()
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.Prs[r.id].Match
+		return
+	}
+	r.broadcastAppend()
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 }
@@ -375,7 +382,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 获取之前发送的日志term
 	logTerm, err := r.RaftLog.Term(prevAppendLogIdx)
 	if err != nil {
-		return false
+		panic(err)
 	}
 	// 将prevIdx+1--size 这部分日志发出去
 	size := len(r.RaftLog.entries)
@@ -418,24 +425,32 @@ func (r *Raft) appendEntries(entries []*pb.Entry) {
 	}
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
-	r.broadcastAppend()
 	if len(r.Prs) == 1 {
+		// 如果只有一个leader节点，则不需要广播，直接commit
 		r.RaftLog.committed = r.Prs[r.id].Match
+		return
 	}
+	r.broadcastAppend()
 }
 
 // startElection follower心跳超时成为候选人 or 候选人选举超时，发起选举
 func (r *Raft) startElection() {
 	// 成为候选人
 	r.becomeCandidate()
+	r.resetHeartbeatTimer()
 	// 重置选举超时计时器
 	r.resetElectionTimer()
 	if len(r.Prs) < 2 {
 		r.becomeLeader()
 		return
 	}
+	lastIdx := r.RaftLog.LastIndex()
+	lastLogTerm, err := r.RaftLog.Term(lastIdx)
+	if err != nil {
+		panic(err)
+	}
 	// 发送请求投票rpc
-	r.broadcastRequestVote()
+	r.broadcastRequestVote(lastIdx, lastLogTerm)
 }
 
 // handleRequestVote 接收投票请求
@@ -452,7 +467,15 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		r.sendVoteResponse(m.From, true)
 		return
 	}
-	// todo 判断日志索引
+	lastIdx := r.RaftLog.LastIndex()
+	lastLogTerm, err := r.RaftLog.Term(lastIdx)
+	if err != nil {
+		panic(err)
+	}
+	if m.LogTerm < lastLogTerm || m.Index < lastIdx {
+		r.sendVoteResponse(m.From, true)
+		return
+	}
 	r.Vote = m.From
 	r.resetElectionTimer()
 	// 成功投票给对方
@@ -470,12 +493,12 @@ func (r *Raft) resetElectionTimer() {
 	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
-func (r *Raft) broadcastRequestVote() {
+func (r *Raft) broadcastRequestVote(index, term uint64) {
 	for peer := range r.Prs {
 		if peer == r.id {
 			continue
 		}
-		r.sendVoteRequest(peer)
+		r.sendVoteRequest(peer, index, term)
 	}
 }
 
@@ -510,12 +533,14 @@ func (r *Raft) broadcastHeartBeat() {
 }
 
 // sendVoteRequest candidate send request for vote
-func (r *Raft) sendVoteRequest(peer uint64) {
+func (r *Raft) sendVoteRequest(to, index, term uint64) {
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
-		To:      peer,
+		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		Index:   index,
+		LogTerm: term,
 	}
 	r.msgs = append(r.msgs, msg)
 }
@@ -542,35 +567,59 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 重置选举计时器
 	r.resetElectionTimer()
 	r.Lead = m.From
-	if m.Index > r.RaftLog.LastIndex() {
+	logLastIdx := r.RaftLog.LastIndex()
+	log.Infof("node:%v ,log last index is:%v", r.id, logLastIdx)
+	if m.Index > logLastIdx {
 		// 如果leader发来的消息索引大于我本地最大的消息，则修改期望发送的消息
-		r.sendAppendResponse(m.From, r.RaftLog.LastIndex()+1, None, true)
+		r.sendAppendResponse(m.From, logLastIdx+1, None, true)
 		return
 	}
-	if m.Index >= r.RaftLog.firstIndex {
+	logFirstIdx := r.RaftLog.firstIndex
+	log.Infof("node:%v ,log first index is:%v", r.id, logFirstIdx)
+	if m.Index >= logFirstIdx {
+		log.Infof("node:%v,recv msg index:%v bigger than first index:%v, need to find out conflict", r.id, m.Index, logFirstIdx)
+		// 根据msg的index查到term
 		logTerm, err := r.RaftLog.Term(m.Index)
 		if err != nil {
 			panic(err)
 		}
+		log.Infof("node:%v,entry term:%v,index:%v", r.id, logTerm, m.Index)
+		// 如果不等，则说明有冲突
 		if logTerm != m.LogTerm {
+			log.Infof("node:%v, rev msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
 			// todo 找到对应term和index的日志索引
 			r.sendAppendResponse(m.From, 0, logTerm, true)
 			return
 		}
 	}
 	for _, entry := range m.Entries {
-		if entry.Index < r.RaftLog.firstIndex {
+		if entry.Index < logFirstIdx {
 			continue
 		}
-		if entry.Index <= r.RaftLog.LastIndex() {
+		if entry.Index <= logLastIdx {
 			// todo 有冲突，修改旧的entry
+			logTerm, err := r.RaftLog.Term(entry.Index)
+			if err != nil {
+				panic(err)
+			}
+			if logTerm != entry.Term {
+				index := int(entry.Index - r.RaftLog.firstIndex)
+				r.RaftLog.entries[index] = *entry
+				// 将后续可能有冲突的entries清除
+				r.RaftLog.entries = r.RaftLog.entries[:index+1]
+				r.RaftLog.stabled = min(r.RaftLog.stabled, entry.Index-1)
+			}
+		} else {
+			// 无冲突，将日志放入
+			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		}
-		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+
 	}
 	if m.Commit > r.RaftLog.committed {
+		// 取两者的较小值
 		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
 	}
-	r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), None, false)
+	r.sendAppendResponse(m.From, logLastIdx, None, false)
 	// Your Code Here (2A).
 }
 
@@ -583,9 +632,11 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		// idx := m.Index
 		return
 	}
+	// 同意接收数据，判断server返回的index
 	if m.Index > r.Prs[m.From].Match {
 		r.Prs[m.From].Match = m.Index
 		r.Prs[m.From].Next = m.Index + 1
+		// 判断是否超半数接收append，leader可提交
 		r.leaderCommit()
 	}
 	// todo handle append-response
