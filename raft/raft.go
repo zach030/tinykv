@@ -472,7 +472,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	if err != nil {
 		panic(err)
 	}
-	if m.LogTerm < lastLogTerm || m.Index < lastIdx {
+	if m.LogTerm < lastLogTerm || m.LogTerm == lastLogTerm && m.Index < lastIdx {
 		r.sendVoteResponse(m.From, true)
 		return
 	}
@@ -505,6 +505,9 @@ func (r *Raft) broadcastRequestVote(index, term uint64) {
 // handleVoteResponse candidate用于处理其他人的投票回复
 func (r *Raft) handleVoteResponse(m pb.Message) {
 	// 判断对方任期
+	if m.Term != None && m.Term < r.Term {
+		return
+	}
 	r.votes[m.From] = !m.Reject
 	agree := 0
 	allVote := len(r.votes)
