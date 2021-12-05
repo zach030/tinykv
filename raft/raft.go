@@ -19,8 +19,6 @@ import (
 	"math/rand"
 	"sort"
 
-	"github.com/pingcap-incubator/tinykv/log"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -577,6 +575,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	logLastIdx := r.RaftLog.LastIndex()
 	// log.Infof("node:%v ,log last index is:%v", r.id, logLastIdx)
 	if m.Index > logLastIdx {
+		// log.Infof("leader msg index:%v,my log index:%v", m.Index, logLastIdx)
 		// 如果leader发来的消息索引大于我本地最大的消息，则修改期望发送的消息
 		r.sendAppendResponse(m.From, logLastIdx+1, None, true)
 		return
@@ -597,8 +596,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				return r.RaftLog.entries[i].Term == logTerm
 			})
 			index := uint64(offset) + r.RaftLog.firstIndex
-			// log.Infof("node:%v, rev msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
-			// todo 找到对应term和index的日志索引
+			// log.Infof("node:%v,find conflict, recv msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
 			r.sendAppendResponse(m.From, index, logTerm, true)
 			return
 		}
@@ -607,8 +605,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if entry.Index < logFirstIdx {
 			continue
 		}
-		if entry.Index <= logLastIdx {
-			// todo 有冲突，修改旧的entry
+		if entry.Index <= r.RaftLog.LastIndex() {
 			logTerm, err := r.RaftLog.Term(entry.Index)
 			if err != nil {
 				panic(err)
@@ -624,14 +621,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			// 无冲突，将日志放入
 			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		}
-
 	}
+	// log.Infof("node:%v,state:%v,msg commit:%v,log commit:%v", r.id, r.State.String(), m.Commit, r.RaftLog.committed)
 	if m.Commit > r.RaftLog.committed {
 		// 取两者的较小值
 		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
-		log.Infof("node:%v,state:%v,commit:%v", r.id, r.State.String(), r.RaftLog.committed)
+		// log.Infof("node:%v,state:%v,commit:%v", r.id, r.State.String(), r.RaftLog.committed)
 	}
-	r.sendAppendResponse(m.From, logLastIdx, None, false)
+	r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), None, false)
 	// Your Code Here (2A).
 }
 
@@ -645,17 +642,18 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		if m.LogTerm != None {
 			logTerm := m.LogTerm
 			l := r.RaftLog
-			sliceIndex := sort.Search(len(l.entries),
-				func(i int) bool { return l.entries[i].Term > logTerm })
+			sliceIndex := sort.Search(len(l.entries), func(i int) bool { return l.entries[i].Term >= logTerm })
 			if sliceIndex > 0 && l.entries[sliceIndex-1].Term == logTerm {
-				idx = uint64(sliceIndex) - r.RaftLog.firstIndex + 1
+				idx = uint64(sliceIndex) + l.firstIndex
+				// log.Infof("leader change new idx for node:%v, next:%v", m.From, idx)
 			}
-			// 更新next
-			r.Prs[m.From].Next = idx
-			// 继续发送append请求
-			r.sendAppend(m.From)
-			return
 		}
+		// 更新next
+		// log.Infof("leader change for node:%v, old next:%v,new next:%v", m.From, m.Index, idx)
+		r.Prs[m.From].Next = idx
+		// 继续发送append请求
+		r.sendAppend(m.From)
+		return
 	}
 	// 同意接收数据，判断server返回的index
 	if m.Index > r.Prs[m.From].Match {
