@@ -19,6 +19,8 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log"
+
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -138,7 +140,7 @@ type Raft struct {
 	// baseline of election interval
 	electionTimeout int
 
-	randomElectionTimeout int
+	randomizedElectionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -178,7 +180,7 @@ func newRaft(c *Config) *Raft {
 		RaftLog:          newLog(c.Storage),
 	}
 	// 随机的选举过期值
-	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	// 从raftlog中恢复存储的状态
 	hardSt, confSt, _ := r.RaftLog.storage.InitialState()
 	if c.peers == nil {
@@ -201,33 +203,48 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+func (r *Raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+	r.resetElectionTimer()
+	r.resetHeartbeatTimer()
+	r.votes = make(map[uint64]bool)
+}
+
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	r.Term = term
+	r.reset(term)
 	r.State = StateFollower
 	r.Lead = lead
-	r.Vote = None
+	log.Debugf("%x became follower at term %d", r.id, r.Term)
 	// Your Code Here (2A).
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
+	if r.State == StateLeader {
+		panic("invalid transition [leader -> candidate]")
+	}
+	r.reset(r.Term + 1)
 	r.State = StateCandidate
-	// term自增
-	r.Term++
 	// 修改vote为自身
 	r.Vote = r.id
 	r.votes[r.id] = true
-	r.Lead = None
+	log.Debugf("%x became candidate at term %d", r.id, r.Term)
 	// Your Code Here (2A).
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
+	if r.State == StateFollower {
+		panic("invalid transfer from follower to leader")
+	}
+	r.reset(r.Term)
 	r.Lead = r.id
 	r.State = StateLeader
-	r.Vote = None
-	r.resetElectionTimer()
 	lastIdx := r.RaftLog.LastIndex()
 	for peer := range r.Prs {
 		if peer == r.id {
@@ -246,6 +263,7 @@ func (r *Raft) becomeLeader() {
 		return
 	}
 	r.broadcastAppend()
+	log.Debugf("%x became leader at term %d", r.id, r.Term)
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 }
@@ -264,20 +282,26 @@ func (r *Raft) tick() {
 // tickWithHeartbeat leader用于处理心跳时钟
 func (r *Raft) tickWithHeartbeat() {
 	r.heartbeatElapsed++
+	r.electionElapsed++
 	// 定期发送心跳
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.resetHeartbeatTimer()
 		// 发送本地beat消息，需要发心跳
-		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+		if err := r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat}); err != nil {
+			log.Errorf("error occurred during heartbeat: %v", err)
+		}
 	}
 }
 
 // tickWithElection follower和candidate用于处理选举时钟
 func (r *Raft) tickWithElection() {
 	r.electionElapsed++
-	if r.electionElapsed >= r.randomElectionTimeout {
+	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.resetElectionTimer()
 		// 选举时钟超时：开始一轮新的选举
-		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+		if err := r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup}); err != nil {
+			log.Errorf("error occurred during election: %v", err)
+		}
 	}
 }
 
@@ -317,8 +341,12 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgHeartbeat:
+		r.resetElectionTimer()
+		r.Lead = m.From
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
+		r.resetElectionTimer()
+		r.Lead = m.From
 		r.handleAppendEntries(m)
 	}
 	return nil
@@ -333,10 +361,11 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleVoteResponse(m)
 	case pb.MessageType_MsgAppend:
-		if m.Term == r.Term {
-			r.becomeFollower(m.Term, m.From)
-		}
+		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
 	}
 	return nil
 }
@@ -408,11 +437,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
+	commit := min(r.Prs[to].Match, r.RaftLog.committed)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		Commit:  commit,
 	}
 	r.msgs = append(r.msgs, msg)
 	// Your Code Here (2A).
@@ -420,10 +451,10 @@ func (r *Raft) sendHeartbeat(to uint64) {
 
 func (r *Raft) appendEntries(entries []*pb.Entry) {
 	lastIdx := r.RaftLog.LastIndex()
-	for i, entry := range entries {
-		entry.Term = r.Term
-		entry.Index = lastIdx + uint64(i) + 1
-		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	for i := range entries {
+		entries[i].Term = r.Term
+		entries[i].Index = lastIdx + uint64(i) + 1
+		r.RaftLog.entries = append(r.RaftLog.entries, *entries[i])
 	}
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
@@ -492,7 +523,7 @@ func (r *Raft) resetHeartbeatTimer() {
 // resetElectionTimer 重置选举超时计时器
 func (r *Raft) resetElectionTimer() {
 	r.electionElapsed = 0
-	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 func (r *Raft) broadcastRequestVote(index, term uint64) {
@@ -639,7 +670,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	// 如果其他节点拒绝接收
 	if m.Reject {
 		idx := m.Index
-		if m.LogTerm != None {
+		if m.LogTerm > 0 {
 			logTerm := m.LogTerm
 			l := r.RaftLog
 			sliceIndex := sort.Search(len(l.entries), func(i int) bool { return l.entries[i].Term >= logTerm })
