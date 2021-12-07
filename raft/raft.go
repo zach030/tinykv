@@ -199,7 +199,7 @@ func newRaft(c *Config) *Raft {
 		}
 		r.Prs[peer] = &Progress{Next: lastIndex + 1}
 	}
-	r.becomeFollower(0, None)
+	r.becomeFollower(r.Term, None)
 	return r
 }
 
@@ -595,7 +595,7 @@ func (r *Raft) sendVoteResponse(to uint64, reject bool) {
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
-	if m.Term != None && r.Term < m.Term {
+	if m.Term != None && m.Term < r.Term {
 		// 如果leader发来的term更小，则拒绝
 		r.sendAppendResponse(m.From, None, None, true)
 		return
