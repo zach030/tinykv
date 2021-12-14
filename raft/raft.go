@@ -203,6 +203,21 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 func (r *Raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
