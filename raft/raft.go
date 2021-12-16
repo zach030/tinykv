@@ -268,6 +268,7 @@ func (r *Raft) becomeLeader() {
 			continue
 		}
 		r.Prs[peer].Next = lastIdx + 1
+		r.Prs[peer].Match = 0
 	}
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
 		Term:  r.Term,
