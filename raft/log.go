@@ -29,30 +29,28 @@ import (
 
 type RaftLog struct {
 	// storage contains all stable entries since the last snapshot.
-	// snapshot-----memory-storage-----------------------------------unstable-entries
-	//              firstIdx----apply/commit---lastIdx,unstableOffset
-	// 维护待快照的entry，定期进行snapshot，是stabled（稳定）数据
+	// raft log的存储实现
 	storage Storage
 
 	// committed is the highest log position that is known to be in
 	// stable storage on a quorum of nodes.
-	// storage中稳定的数据中的最高位
+	// 已提交日志的索引
 	committed uint64
 
 	// applied is the highest log position that the application has
 	// been instructed to apply to its state machine.
 	// Invariant: applied <= committed
-	// 上层已应用到状态机的index
+	// 上层已应用到状态机的索引
 	applied uint64
 
 	// log entries with index <= stabled are persisted to storage.
 	// It is used to record the logs that are not persisted by storage yet.
 	// Everytime handling `Ready`, the unstabled logs will be included.
-	// 持久存储与未持久存储的界限
+	// 已持久化的索引
 	stabled uint64
 
 	// all entries that have not yet compact.
-	// 所有未进行快照的log（inmemory和unstable）
+	// 内存中存储的log
 	entries []pb.Entry
 
 	// the incoming unstable snapshot, if any.
@@ -60,7 +58,7 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
-	firstIndex uint64
+	FirstIdx uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -69,26 +67,29 @@ func newLog(storage Storage) *RaftLog {
 	if storage == nil {
 		panic("storage must not nil")
 	}
-	firstIdx, err := storage.FirstIndex()
-	if err != nil {
+	var (
+		firstIdx uint64
+		lastIdx  uint64
+		err      error
+		entries  []pb.Entry
+	)
+	if firstIdx, err = storage.FirstIndex(); err != nil {
 		panic(err)
 	}
-	lastIdx, err := storage.LastIndex()
-	if err != nil {
+	if lastIdx, err = storage.LastIndex(); err != nil {
 		panic(err)
 	}
-	entries, err := storage.Entries(firstIdx, lastIdx+1)
-	if err != nil {
+	if entries, err = storage.Entries(firstIdx, lastIdx+1); err != nil {
 		panic(err)
 	}
 	// Your Code Here (2A).
 	return &RaftLog{
-		storage:    storage,
-		committed:  firstIdx - 1,
-		applied:    firstIdx - 1,
-		stabled:    lastIdx,
-		entries:    entries,
-		firstIndex: firstIdx,
+		storage:   storage,
+		committed: firstIdx - 1,
+		applied:   firstIdx - 1,
+		stabled:   lastIdx,
+		entries:   entries,
+		FirstIdx:  firstIdx,
 	}
 }
 
@@ -98,13 +99,13 @@ func newLog(storage Storage) *RaftLog {
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 	first, _ := l.storage.FirstIndex()
-	if first > l.firstIndex {
+	if first > l.FirstIdx {
 		if len(l.entries) > 0 {
-			entries := l.entries[first-l.firstIndex:]
+			entries := l.entries[first-l.FirstIdx:]
 			l.entries = make([]pb.Entry, len(entries))
 			copy(l.entries, entries)
 		}
-		l.firstIndex = first
+		l.FirstIdx = first
 	}
 }
 
@@ -112,17 +113,16 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if len(l.entries) > 0 {
-		// firstIdx------lastIdx(stable)-----apply----commit
-		//            unstable:|------------------------------|
-		return l.entries[l.stabled-l.firstIndex+1:]
+		// 取stabled下标往后的log
+		return l.entries[l.getRelativeIdx(l.stabled):]
 	}
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	applyIdx := l.applied - l.firstIndex + 1
-	commitIdx := l.committed - l.firstIndex + 1
+	applyIdx := l.getRelativeIdx(l.applied)
+	commitIdx := l.getRelativeIdx(l.committed)
 	if len(l.entries) > 0 {
 		return l.entries[applyIdx:commitIdx]
 	}
@@ -151,9 +151,13 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if len(l.entries) > 0 && i >= l.firstIndex {
-		// log.Infof("entry size:%v,pos is:%v,fistidx:%v", len(l.entries), i, l.firstIndex)
-		return l.entries[i-l.firstIndex].Term, nil
+	if len(l.entries) > 0 && i >= l.FirstIdx {
+		// log.Infof("entry size:%v,pos is:%v,fistidx:%v", len(l.entries), i, l.FirstIdx)
+		return l.entries[i-l.FirstIdx].Term, nil
 	}
 	return 0, nil
+}
+
+func (l *RaftLog) getRelativeIdx(index uint64) uint64 {
+	return index - l.FirstIdx + 1
 }

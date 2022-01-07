@@ -156,15 +156,20 @@ func (rn *RawNode) Ready() Ready {
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 		Messages:         rn.Raft.msgs,
 	}
-	if rn.softState.RaftState != rn.Raft.State || rn.softState.Lead != rn.Raft.Lead {
-		rn.softState = rn.Raft.softState()
+	var (
+		currSoftState = rn.softState
+		currHardState = rn.storedHardState
+	)
+	if currSoftState.RaftState != rn.Raft.State || currSoftState.Lead != rn.Raft.Lead {
+		currSoftState = rn.Raft.softState()
 	}
 	// soft与hard state都判断是否变更，需要更新
-	if !isHardStateEqual(rn.Raft.hardState(), rn.storedHardState) {
-		rn.storedHardState = rn.Raft.hardState()
+	if !isHardStateEqual(rn.Raft.hardState(), currHardState) {
+		currHardState = rn.Raft.hardState()
 	}
-	rn.Raft.msgs = make([]pb.Message, 0)
+	rn.storedHardState, rn.softState = currHardState, currSoftState
 	// msgs需要清空
+	rn.Raft.msgs = make([]pb.Message, 0)
 	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 		rn.Raft.RaftLog.pendingSnapshot = nil

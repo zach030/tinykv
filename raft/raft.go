@@ -434,7 +434,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 将prevIdx+1--size 这部分日志发出去
 	size := len(r.RaftLog.entries)
 	ents := make([]*pb.Entry, 0)
-	for i := int(prevAppendLogIdx + 1 - r.RaftLog.firstIndex); i < size; i++ {
+	for i := int(prevAppendLogIdx + 1 - r.RaftLog.FirstIdx); i < size; i++ {
 		ents = append(ents, &r.RaftLog.entries[i])
 	}
 	msg := pb.Message{
@@ -627,7 +627,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.sendAppendResponse(m.From, logLastIdx+1, None, true)
 		return
 	}
-	logFirstIdx := r.RaftLog.firstIndex
+	logFirstIdx := r.RaftLog.FirstIdx
 	// log.Infof("node:%v ,log first index is:%v", r.id, logFirstIdx)
 	if m.Index >= logFirstIdx {
 		// log.Infof("node:%v,recv msg index:%v bigger than first index:%v, need to find out conflict", r.id, m.Index, logFirstIdx)
@@ -639,10 +639,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// log.Infof("node:%v,entry term:%v,index:%v", r.id, logTerm, m.Index)
 		// 如果不等，则说明有冲突
 		if logTerm != m.LogTerm {
-			offset := sort.Search(int(m.Index+1-r.RaftLog.firstIndex), func(i int) bool {
+			offset := sort.Search(int(m.Index+1-r.RaftLog.FirstIdx), func(i int) bool {
 				return r.RaftLog.entries[i].Term == logTerm
 			})
-			index := uint64(offset) + r.RaftLog.firstIndex
+			index := uint64(offset) + r.RaftLog.FirstIdx
 			// log.Infof("node:%v,find conflict, recv msg entry term:%v , log entry term is:%v", r.id, m.LogTerm, logTerm)
 			r.sendAppendResponse(m.From, index, logTerm, true)
 			return
@@ -658,7 +658,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				panic(err)
 			}
 			if logTerm != entry.Term {
-				index := int(entry.Index - r.RaftLog.firstIndex)
+				index := int(entry.Index - r.RaftLog.FirstIdx)
 				r.RaftLog.entries[index] = *entry
 				// 将后续可能有冲突的entries清除
 				r.RaftLog.entries = r.RaftLog.entries[:index+1]
@@ -691,7 +691,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			l := r.RaftLog
 			sliceIndex := sort.Search(len(l.entries), func(i int) bool { return l.entries[i].Term >= logTerm })
 			if sliceIndex > 0 && l.entries[sliceIndex-1].Term == logTerm {
-				idx = uint64(sliceIndex) + l.firstIndex
+				idx = uint64(sliceIndex) + l.FirstIdx
 				// log.Infof("leader change new idx for node:%v, next:%v", m.From, idx)
 			}
 		}

@@ -308,6 +308,37 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+	first, _ := ps.FirstIndex()
+	last := entries[len(entries)-1].Index
+	// 对新添加的entry部分下标进行判断，截取
+	// shortcut if there is no new entry.
+	if last < first {
+		return nil
+	}
+	// truncate compacted entries
+	if first > entries[0].Index {
+		// 有一部分旧的entry，已经被快照，只取firstIdx后面的部分记录
+		entries = entries[first-entries[0].Index:]
+	}
+	// 构造raftWB
+	for _, entry := range entries {
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), entry.Index), &entry); err != nil {
+			continue
+		}
+	}
+	// ps:   -----first----apply----committed----------last
+	// entry:                           entry----last（新entry的last比storage里的要小）
+	prevLast, _ := ps.LastIndex()
+	if prevLast > last {
+		for i := last + 1; i <= prevLast; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), i))
+		}
+	}
+	ps.raftState.LastIndex = last
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	return nil
 }
 
@@ -331,7 +362,33 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	// snapshot/kv(key,values)/raft(log)
+	var (
+		raftWB = &engine_util.WriteBatch{}
+		result = &ApplySnapResult{}
+		err    error
+	)
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		// 有snapshot,更新
+		kvWB := &engine_util.WriteBatch{}
+		result, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		err = kvWB.WriteToDB(ps.Engines.Kv)
+	}
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return result, err
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+	// 保存hardstate：regionID，节点raft状态
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState); err != nil {
+		return result, err
+	}
+	// 将raft log写入db
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return result, err
+	}
+	return result, err
 }
 
 func (ps *PeerStorage) ClearData() {
